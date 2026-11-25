@@ -11,54 +11,121 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const SESSION_DIR = process.env.SESSION_DIR || '/data/session';
 
+let sendQueue = Promise.resolve();
+
+function queueSend(task) {
+    const result = sendQueue.then(task);
+
+    sendQueue = result.catch(() => {});
+
+    return result;
+}
+
 let sock = null;
 let qr = null;
 let connected = false;
+let reconnectTimer = null;
+let starting = false;
 
 async function startWhatsApp() {
-    const { state, saveCreds } =
-        await useMultiFileAuthState(SESSION_DIR);
+    if (starting) {
+        console.log('WhatsApp start already in progress');
+        return;
+    }
 
-    sock = makeWASocket({
-        auth: state,
-        printQRInTerminal: false,
-    });
+    starting = true;
 
-    sock.ev.on('creds.update', saveCreds);
+    try {
+        const { state, saveCreds } =
+            await useMultiFileAuthState(SESSION_DIR);
 
-    sock.ev.on('connection.update', async (update) => {
-        const {
-            connection,
-            lastDisconnect,
-            qr: newQr,
-        } = update;
+        const newSock = makeWASocket({
+            auth: state,
+            printQRInTerminal: false,
+        });
 
-        if (newQr) {
-            qr = newQr;
-            console.log('New WhatsApp QR generated');
-        }
+		if (sock && sock !== newSock) {
+			try {
+				sock.end(undefined);
+			} catch (e) {
+				console.error('Error closing old socket:', e);
+			}
+		}
 
-        if (connection === 'open') {
-            connected = true;
-            qr = null;
+        sock = newSock;
 
-            console.log('WhatsApp connected');
-        }
+        newSock.ev.on('creds.update', saveCreds);
 
-        if (connection === 'close') {
-            connected = false;
+        newSock.ev.on('connection.update', (update) => {
+            const {
+                connection,
+                lastDisconnect,
+                qr: newQr
+            } = update;
 
-            const statusCode =
-                lastDisconnect?.error?.output?.statusCode;
-
-            if (statusCode !== DisconnectReason.loggedOut) {
-                console.log('WhatsApp disconnected, reconnecting...');
-                setTimeout(startWhatsApp, 3000);
-            } else {
-                console.log('WhatsApp logged out');
+            if (newQr) {
+                qr = newQr;
+                console.log('New WhatsApp QR generated');
             }
+
+            if (connection === 'open') {
+                connected = true;
+                qr = null;
+                starting = false;
+
+                console.log('WhatsApp connected');
+            }
+
+            if (connection === 'close') {
+                connected = false;
+
+                // Не даём старому socket оставаться активным
+                if (sock === newSock) {
+                    sock = null;
+                }
+
+                starting = false;
+
+                const statusCode =
+                    lastDisconnect?.error?.output?.statusCode;
+
+                console.error(
+					'WhatsApp disconnected:',
+					{
+						statusCode,
+						reason: lastDisconnect?.error?.message,
+						error: lastDisconnect?.error,
+					}
+				);
+
+                if (statusCode !== DisconnectReason.loggedOut) {
+                    if (!reconnectTimer) {
+                        reconnectTimer = setTimeout(() => {
+                            reconnectTimer = null;
+                            startWhatsApp();
+                        }, 3000);
+                    }
+                } else {
+                    console.log('WhatsApp logged out');
+                }
+            }
+        });
+
+    } catch (error) {
+        starting = false;
+
+        console.error(
+            'WhatsApp start error:',
+            error
+        );
+
+        if (!reconnectTimer) {
+            reconnectTimer = setTimeout(() => {
+                reconnectTimer = null;
+                startWhatsApp();
+            }, 3000);
         }
-    });
+    }
 }
 
 // Status and QR sessions scan
@@ -121,7 +188,7 @@ app.get('/whatsapp/qr', async (req, res) => {
 // Send message
 app.post('/whatsapp/send', async (req, res) => {
     try {
-        if (!connected) {
+        if (!connected || !sock) {
             return res.status(503).json({
                 error: 'WhatsApp is not connected',
             });
@@ -137,16 +204,25 @@ app.post('/whatsapp/send', async (req, res) => {
 
         const jid = `${phone}@s.whatsapp.net`;
 
-        const result = await sock.sendMessage(jid, {
-            text: message,
+        const result = await queueSend(async () => {
+            if (!connected || !sock) {
+                throw new Error('WhatsApp disconnected');
+            }
+
+            console.log(`Sending WhatsApp message to ${jid}`);
+
+            return await sock.sendMessage(jid, {
+                text: message,
+            });
         });
 
         res.json({
             success: true,
             message_id: result?.key?.id,
         });
+
     } catch (error) {
-        console.error(error);
+        console.error('WhatsApp send error:', error);
 
         res.status(500).json({
             success: false,
